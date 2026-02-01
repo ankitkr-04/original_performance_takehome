@@ -1,0 +1,8 @@
+{
+  "chat.tools.terminal.autoApprove": {
+    "/^cd /home/ankit/Documents/mastery/projects/original_performance_takehome && python -c \"\nfrom perf_takehome import KernelBuilder, do_kernel_test\nfrom problem import VLEN, HASH_STAGES\n\n# Test a simple case\ntry:\n    do_kernel_test\\(10, 16, 256, prints=False\\)\nexcept AssertionError as e:\n    print\\(f'Error: \\{e\\}'\\)\n\"$/": {
+      "approve": true,
+      "matchCommandLine": true
+    }
+  }
+}

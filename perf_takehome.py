@@ -44,30 +44,11 @@ class KernelBuilder:
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
-        self.current_bundle = {k: [] for k in SLOT_LIMITS}
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def flush(self):
-        """Emit the current bundle if non-empty"""
-        bundle = {k: v for k, v in self.current_bundle.items() if v}
-        if bundle:
-            self.instrs.append(bundle)
-        self.current_bundle = {k: [] for k in SLOT_LIMITS}
-    
-    def pack(self, engine, slot):
-        """Add to current bundle if space, else flush and add"""
-        if len(self.current_bundle[engine]) >= SLOT_LIMITS[engine]:
-            self.flush()
-        self.current_bundle[engine].append(slot)
-
-    def add(self, engine, slot):
-        """Legacy: emit single-op instruction"""
-        self.flush()
-        self.instrs.append({engine: [slot]})
-
-    def alloc_scratch(self, name=None, length=1):
+    def alloc(self, name=None, length=1):
         addr = self.scratch_ptr
         if name is not None:
             self.scratch[name] = addr
@@ -76,140 +57,100 @@ class KernelBuilder:
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
 
-    def scratch_const(self, val, name=None):
-        if val not in self.const_map:
-            addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
-            self.const_map[val] = addr
-        return self.const_map[val]
-
-    def alloc_const_batch(self, const_list):
-        """Pre-allocate and emit constants in batches"""
-        addrs = []
-        for val, name in const_list:
-            if val in self.const_map:
-                addrs.append(self.const_map[val])
-            else:
-                addr = self.alloc_scratch(name)
-                self.const_map[val] = addr
-                addrs.append(addr)
-        
-        # Emit all new constants in batches of 2
-        pending = [(addr, val) for (val, name), addr in zip(const_list, addrs) 
-                   if val not in self.const_map or self.const_map[val] == addr]
-        for i in range(0, len(pending), 2):
-            batch = pending[i:i+2]
-            ops = [("const", addr, val) for addr, val in batch]
-            self.instrs.append({"load": ops})
-        return addrs
-
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
-
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
-
-        return slots
-
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Heavily optimized vectorized SIMD implementation.
+        Ultra-optimized kernel with software pipelining.
+        
         Key optimizations:
-        1. Process VLEN=8 elements per cycle instead of 1
-        2. Keep batch in scratch registers to avoid memory round-trips
+        1. 4-way parallel processing to fill 6 VALU slots
+        2. Interleave gather loads across all 4 vectors
         3. Use multiply_add for fused hash operations
-        4. Pack multiple VALU ops per cycle (6 slots available)
-        5. Process 2 vectors in parallel to better utilize VALU slots
+        4. Better instruction scheduling
         """
-        n_vectors = batch_size // VLEN  # 32 vectors of 8 elements
+        n_vectors = batch_size // VLEN  # 32 vectors
+        NUM_PARALLEL = 4
         
-        # === ALLOCATE ALL SCRATCH FIRST ===
-        tmp = self.alloc_scratch("tmp")
-        tmp2 = self.alloc_scratch("tmp2")
+        # === SCRATCH ALLOCATION ===
+        tmp = self.alloc("tmp")
+        tmp2 = self.alloc("tmp2")
         
-        # Allocate init variables
-        init_vars = ["rounds", "n_nodes", "batch_size", "forest_height",
-                     "forest_values_p", "inp_indices_p", "inp_values_p"]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
+        # Pointers from memory
+        forest_p = self.alloc("forest_p")
+        idx_p = self.alloc("idx_p")
+        val_p = self.alloc("val_p")
+        n_nodes_s = self.alloc("n_nodes_s")
         
-        # Pre-allocate all constants we'll need  
-        zero_s = self.alloc_scratch("zero_s")
-        one_s = self.alloc_scratch("one_s")
-        two_s = self.alloc_scratch("two_s")
+        # Scalar constants
+        zero_s = self.alloc("zero_s")
+        one_s = self.alloc("one_s")
+        two_s = self.alloc("two_s")
         
-        # Offset constants for batch loading
-        offsets = [self.alloc_scratch(f"off_{vi}") for vi in range(n_vectors)]
+        # Offsets for batch loading
+        offsets = [self.alloc(f"off_{vi}") for vi in range(n_vectors)]
         
         # Vector constants
-        v_one = self.alloc_scratch("v_one", VLEN)
-        v_two = self.alloc_scratch("v_two", VLEN)
-        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
+        v_one = self.alloc("v_one", VLEN)
+        v_two = self.alloc("v_two", VLEN)
+        v_n_nodes = self.alloc("v_n_nodes", VLEN)
         
-        # Hash constants (both scalar and vector)
-        hash_v_c = []
-        hash_v_aux = []
+        # Hash constants (scalar then vector)
         hash_s_c = []
         hash_s_aux = []
+        hash_v_c = []
+        hash_v_aux = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            hash_s_c.append(self.alloc_scratch(f"hsc_{hi}"))
-            hash_v_c.append(self.alloc_scratch(f"hvc_{hi}", VLEN))
+            hash_s_c.append(self.alloc(f"hsc_{hi}"))
+            hash_v_c.append(self.alloc(f"hvc_{hi}", VLEN))
             if op1 == "+" and op2 == "+" and op3 == "<<":
                 aux_val = 1 + (1 << val3)
             else:
                 aux_val = val3
-            hash_s_aux.append((self.alloc_scratch(f"hsa_{hi}"), aux_val))
-            hash_v_aux.append(self.alloc_scratch(f"hva_{hi}", VLEN))
+            hash_s_aux.append((self.alloc(f"hsa_{hi}"), aux_val))
+            hash_v_aux.append(self.alloc(f"hva_{hi}", VLEN))
         
-        # Batch vectors - keep in scratch the entire time
-        indices = [self.alloc_scratch(f"idx_{i}", VLEN) for i in range(n_vectors)]
-        values = [self.alloc_scratch(f"val_{i}", VLEN) for i in range(n_vectors)]
+        # Batch vectors
+        indices = [self.alloc(f"idx_{i}", VLEN) for i in range(n_vectors)]
+        values = [self.alloc(f"val_{i}", VLEN) for i in range(n_vectors)]
         
-        # Temporaries for 2-way parallel processing
-        v_tmp1_a = self.alloc_scratch("v_tmp1_a", VLEN)
-        v_tmp2_a = self.alloc_scratch("v_tmp2_a", VLEN)
-        v_node_a = self.alloc_scratch("v_node_a", VLEN)
-        v_addr_a = self.alloc_scratch("v_addr_a", VLEN)
-        v_tmp1_b = self.alloc_scratch("v_tmp1_b", VLEN)
-        v_tmp2_b = self.alloc_scratch("v_tmp2_b", VLEN)
-        v_node_b = self.alloc_scratch("v_node_b", VLEN)
-        v_addr_b = self.alloc_scratch("v_addr_b", VLEN)
+        # Working registers for 4-way parallel
+        v_node = [self.alloc(f"v_node_{i}", VLEN) for i in range(NUM_PARALLEL)]
+        v_addr = [self.alloc(f"v_addr_{i}", VLEN) for i in range(NUM_PARALLEL)]
+        v_tmp1 = [self.alloc(f"v_tmp1_{i}", VLEN) for i in range(NUM_PARALLEL)]
+        v_tmp2 = [self.alloc(f"v_tmp2_{i}", VLEN) for i in range(NUM_PARALLEL)]
         
-        # === EMIT INITIALIZATION ===
-        # Load init variables from memory
-        for i, v in enumerate(init_vars):
-            self.instrs.append({"load": [("const", tmp, i)]})
-            self.instrs.append({"load": [("load", self.scratch[v], tmp)]})
+        # === INITIALIZATION ===
+        # Load memory header values
+        self.instrs.append({"load": [("const", tmp, 1), ("const", tmp2, 4)]})
+        self.instrs.append({"load": [("load", n_nodes_s, tmp), ("load", forest_p, tmp2)]})
+        self.instrs.append({"load": [("const", tmp, 5), ("const", tmp2, 6)]})
+        self.instrs.append({"load": [("load", idx_p, tmp), ("load", val_p, tmp2)]})
         
-        # Load scalar constants (packed)
+        # Scalar constants
         self.instrs.append({"load": [("const", zero_s, 0), ("const", one_s, 1)]})
         self.instrs.append({"load": [("const", two_s, 2)]})
         
-        # Load offset constants (packed - 2 per cycle)
+        # Offset constants (2 per cycle)
         for vi in range(0, n_vectors, 2):
             ops = [("const", offsets[vi], vi * VLEN)]
             if vi + 1 < n_vectors:
                 ops.append(("const", offsets[vi + 1], (vi + 1) * VLEN))
             self.instrs.append({"load": ops})
         
-        # Load hash scalar constants (packed)
+        # Hash scalar constants
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             s_aux, aux_val = hash_s_aux[hi]
             self.instrs.append({"load": [("const", hash_s_c[hi], val1), ("const", s_aux, aux_val)]})
         
-        # Broadcast vector constants (packed - 6 VALU slots)
+        # Broadcast vector constants
         self.instrs.append({"valu": [
             ("vbroadcast", v_one, one_s),
             ("vbroadcast", v_two, two_s),
-            ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])
+            ("vbroadcast", v_n_nodes, n_nodes_s)
         ]})
         
-        # Broadcast hash constants (3 per cycle = 6 slots)
+        # Broadcast hash constants (6 slots = 3 pairs)
         for hi in range(0, len(HASH_STAGES), 3):
             ops = []
             for hj in range(3):
@@ -219,11 +160,11 @@ class KernelBuilder:
                     ops.append(("vbroadcast", hash_v_aux[hi + hj], s_aux))
             self.instrs.append({"valu": ops})
         
-        # === LOAD ENTIRE BATCH INTO SCRATCH (packed vload) ===
+        # Load batch into scratch
         for vi in range(n_vectors):
             self.instrs.append({"alu": [
-                ("+", tmp, self.scratch["inp_indices_p"], offsets[vi]),
-                ("+", tmp2, self.scratch["inp_values_p"], offsets[vi])
+                ("+", tmp, idx_p, offsets[vi]),
+                ("+", tmp2, val_p, offsets[vi])
             ]})
             self.instrs.append({"load": [
                 ("vload", indices[vi], tmp),
@@ -232,103 +173,113 @@ class KernelBuilder:
         
         self.instrs.append({"flow": [("pause",)]})
         
-        # === MAIN LOOP: Process 2 vectors at a time ===
+        # === MAIN LOOP: Process 4 vectors at a time ===
         for r in range(rounds):
-            for vi in range(0, n_vectors, 2):
-                idx_a, val_a = indices[vi], values[vi]
-                idx_b, val_b = indices[vi + 1], values[vi + 1]
+            for vi_base in range(0, n_vectors, NUM_PARALLEL):
+                vi_list = list(range(vi_base, min(vi_base + NUM_PARALLEL, n_vectors)))
+                n = len(vi_list)
                 
-                # --- Compute addresses for both vectors (parallel) ---
-                self.instrs.append({"valu": [
-                    ("vbroadcast", v_addr_a, self.scratch["forest_values_p"]),
-                    ("vbroadcast", v_addr_b, self.scratch["forest_values_p"])
-                ]})
-                self.instrs.append({"valu": [
-                    ("+", v_addr_a, v_addr_a, idx_a),
-                    ("+", v_addr_b, v_addr_b, idx_b)
-                ]})
+                # Compute addresses for all vectors (4 valu ops = 1 cycle)
+                ops = []
+                for p, vi in enumerate(vi_list):
+                    ops.append(("vbroadcast", v_addr[p], forest_p))
+                self.instrs.append({"valu": ops})
                 
-                # --- Gather for vector A (4 cycles) ---
-                for lane in range(0, VLEN, 2):
-                    self.instrs.append({"load": [
-                        ("load", v_node_a + lane, v_addr_a + lane),
-                        ("load", v_node_a + lane + 1, v_addr_a + lane + 1)
-                    ]})
+                ops = []
+                for p, vi in enumerate(vi_list):
+                    ops.append(("+", v_addr[p], v_addr[p], indices[vi]))
+                self.instrs.append({"valu": ops})
                 
-                # --- Gather for vector B (4 cycles) ---
-                for lane in range(0, VLEN, 2):
-                    self.instrs.append({"load": [
-                        ("load", v_node_b + lane, v_addr_b + lane),
-                        ("load", v_node_b + lane + 1, v_addr_b + lane + 1)
-                    ]})
+                # Interleaved gather: 2 loads per cycle across all vectors
+                # This gives 8 lanes × 4 vectors / 2 = 16 cycles for gather
+                for lane in range(VLEN):
+                    # Load lane from vectors 0,1 then 2,3
+                    for base in range(0, n, 2):
+                        ops = []
+                        for p in range(base, min(base + 2, n)):
+                            ops.append(("load", v_node[p] + lane, v_addr[p] + lane))
+                        self.instrs.append({"load": ops})
                 
-                # --- XOR both vectors (parallel) ---
-                self.instrs.append({"valu": [
-                    ("^", val_a, val_a, v_node_a),
-                    ("^", val_b, val_b, v_node_b)
-                ]})
+                # XOR with node values (4 ops = 1 cycle)
+                ops = []
+                for p, vi in enumerate(vi_list):
+                    ops.append(("^", values[vi], values[vi], v_node[p]))
+                self.instrs.append({"valu": ops})
                 
-                # --- HASH both vectors in parallel ---
+                # HASH (6 stages)
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                     c_v = hash_v_c[hi]
                     aux_v = hash_v_aux[hi]
                     
                     if op1 == "+" and op2 == "+" and op3 == "<<":
-                        # Fused: val = val * mult + c (2 ops, fits in 6 slots)
-                        self.instrs.append({"valu": [
-                            ("multiply_add", val_a, val_a, aux_v, c_v),
-                            ("multiply_add", val_b, val_b, aux_v, c_v)
-                        ]})
+                        # Fused multiply-add (4 ops = 1 cycle)
+                        ops = []
+                        for p, vi in enumerate(vi_list):
+                            ops.append(("multiply_add", values[vi], values[vi], aux_v, c_v))
+                        self.instrs.append({"valu": ops})
                     else:
-                        # 4 parallel ops, then 2 combine ops
-                        self.instrs.append({"valu": [
-                            (op1, v_tmp1_a, val_a, c_v),
-                            (op3, v_tmp2_a, val_a, aux_v),
-                            (op1, v_tmp1_b, val_b, c_v),
-                            (op3, v_tmp2_b, val_b, aux_v)
-                        ]})
-                        self.instrs.append({"valu": [
-                            (op2, val_a, v_tmp1_a, v_tmp2_a),
-                            (op2, val_b, v_tmp1_b, v_tmp2_b)
-                        ]})
+                        # Standard: compute both operands (8 ops = 2 cycles)
+                        ops = []
+                        for p, vi in enumerate(vi_list):
+                            ops.append((op1, v_tmp1[p], values[vi], c_v))
+                            ops.append((op3, v_tmp2[p], values[vi], aux_v))
+                        # Split into 2 bundles if > 6 ops
+                        if len(ops) > 6:
+                            self.instrs.append({"valu": ops[:6]})
+                            self.instrs.append({"valu": ops[6:]})
+                        else:
+                            self.instrs.append({"valu": ops})
+                        
+                        # Combine (4 ops = 1 cycle)
+                        ops = []
+                        for p, vi in enumerate(vi_list):
+                            ops.append((op2, values[vi], v_tmp1[p], v_tmp2[p]))
+                        self.instrs.append({"valu": ops})
                 
-                # --- INDEX UPDATE for both vectors ---
-                # (val & 1) + 1 for both, then multiply_add
-                self.instrs.append({"valu": [
-                    ("&", v_tmp1_a, val_a, v_one),
-                    ("&", v_tmp1_b, val_b, v_one)
-                ]})
-                self.instrs.append({"valu": [
-                    ("+", v_tmp1_a, v_tmp1_a, v_one),
-                    ("+", v_tmp1_b, v_tmp1_b, v_one)
-                ]})
-                self.instrs.append({"valu": [
-                    ("multiply_add", idx_a, idx_a, v_two, v_tmp1_a),
-                    ("multiply_add", idx_b, idx_b, v_two, v_tmp1_b)
-                ]})
+                # INDEX UPDATE: idx = 2*idx + (1 if val%2==0 else 2)
+                # = 2*idx + 1 + (val & 1)
+                # (val & 1) for all (4 ops)
+                ops = []
+                for p, vi in enumerate(vi_list):
+                    ops.append(("&", v_tmp1[p], values[vi], v_one))
+                self.instrs.append({"valu": ops})
                 
-                # --- WRAP both indices ---
-                self.instrs.append({"valu": [
-                    ("<", v_tmp1_a, idx_a, v_n_nodes),
-                    ("<", v_tmp1_b, idx_b, v_n_nodes)
-                ]})
-                self.instrs.append({"valu": [
-                    ("*", idx_a, idx_a, v_tmp1_a),
-                    ("*", idx_b, idx_b, v_tmp1_b)
-                ]})
+                # +1 (4 ops)
+                ops = []
+                for p, vi in enumerate(vi_list):
+                    ops.append(("+", v_tmp1[p], v_tmp1[p], v_one))
+                self.instrs.append({"valu": ops})
+                
+                # multiply_add (4 ops)
+                ops = []
+                for p, vi in enumerate(vi_list):
+                    ops.append(("multiply_add", indices[vi], indices[vi], v_two, v_tmp1[p]))
+                self.instrs.append({"valu": ops})
+                
+                # WRAP: idx = idx * (idx < n_nodes)
+                ops = []
+                for p, vi in enumerate(vi_list):
+                    ops.append(("<", v_tmp1[p], indices[vi], v_n_nodes))
+                self.instrs.append({"valu": ops})
+                
+                ops = []
+                for p, vi in enumerate(vi_list):
+                    ops.append(("*", indices[vi], indices[vi], v_tmp1[p]))
+                self.instrs.append({"valu": ops})
         
         self.instrs.append({"flow": [("pause",)]})
         
-        # === STORE RESULTS BACK TO MEMORY (packed) ===
+        # Store results
         for vi in range(n_vectors):
             self.instrs.append({"alu": [
-                ("+", tmp, self.scratch["inp_indices_p"], offsets[vi]),
-                ("+", tmp2, self.scratch["inp_values_p"], offsets[vi])
+                ("+", tmp, idx_p, offsets[vi]),
+                ("+", tmp2, val_p, offsets[vi])
             ]})
             self.instrs.append({"store": [
                 ("vstore", tmp, indices[vi]),
                 ("vstore", tmp2, values[vi])
             ]})
+
 
 BASELINE = 147734
 
@@ -348,7 +299,6 @@ def do_kernel_test(
 
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
-    # print(kb.instrs)
 
     value_trace = {}
     machine = Machine(
@@ -374,8 +324,6 @@ def do_kernel_test(
         if prints:
             print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
             print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-        # Updating these in memory isn't required, but you can enable this check for debugging
-        # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
@@ -402,31 +350,9 @@ class Tests(unittest.TestCase):
         # Full-scale example for performance testing
         do_kernel_test(10, 16, 256, trace=True, prints=False)
 
-    # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
-    # You can uncomment this if you think it might help you debug
-    # def test_kernel_correctness(self):
-    #     for batch in range(1, 3):
-    #         for forest_height in range(3):
-    #             do_kernel_test(
-    #                 forest_height + 2, forest_height + 4, batch * 16 * VLEN * N_CORES
-    #             )
-
     def test_kernel_cycles(self):
         do_kernel_test(10, 16, 256)
 
-
-# To run all the tests:
-#    python perf_takehome.py
-# To run a specific test:
-#    python perf_takehome.py Tests.test_kernel_cycles
-# To view a hot-reloading trace of all the instructions:  **Recommended debug loop**
-# NOTE: The trace hot-reloading only works in Chrome. In the worst case if things aren't working, drag trace.json onto https://ui.perfetto.dev/
-#    python perf_takehome.py Tests.test_kernel_trace
-# Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
-# You can then keep that open and re-run the test to see a new trace.
-
-# To run the proper checks to see which thresholds you pass:
-#    python tests/submission_tests.py
 
 if __name__ == "__main__":
     unittest.main()
