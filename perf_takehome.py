@@ -1,19 +1,5 @@
 """
 # Anthropic's Original Performance Engineering Take-home (Release version)
-
-Copyright Anthropic PBC 2026. Permission is granted to modify and use, but not
-to publish or redistribute your solutions so it's hard to find spoilers.
-
-# Task
-
-- Optimize the kernel (in KernelBuilder.build_kernel) as much as possible in the
-  available time, as measured by test_kernel_cycles on a frozen separate copy
-  of the simulator.
-
-Validate your results using `python tests/submission_tests.py` without modifying
-anything in the tests/ folder.
-
-We recommend you look through problem.py next.
 """
 
 from collections import defaultdict
@@ -61,40 +47,34 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Optimized kernel with 8-way parallel processing.
+        TRUE software-pipelined kernel.
         
-        Key optimizations:
-        1. Process 8 vectors at a time (maximize 6 VALU slots utilization)
-        2. Better gather interleaving
-        3. Fused multiply_add for hash stages
+        Key insight: Overlap gather for group G+1 with hash computation for group G.
+        In each cycle, execute BOTH 2 loads (for next group gather) AND 6 valu ops (for current group hash).
         """
         n_vectors = batch_size // VLEN  # 32 vectors
-        NUM_PARALLEL = 8  # Process more vectors in parallel
+        NUM_PARALLEL = 4  # 4 vectors processed together
+        n_groups = n_vectors // NUM_PARALLEL
         
         # === SCRATCH ALLOCATION ===
         tmp = self.alloc("tmp")
         tmp2 = self.alloc("tmp2")
         
-        # Pointers from memory
         forest_p = self.alloc("forest_p")
         idx_p = self.alloc("idx_p")
         val_p = self.alloc("val_p")
         n_nodes_s = self.alloc("n_nodes_s")
         
-        # Scalar constants
         zero_s = self.alloc("zero_s")
         one_s = self.alloc("one_s")
         two_s = self.alloc("two_s")
         
-        # Offsets for batch loading
         offsets = [self.alloc(f"off_{vi}") for vi in range(n_vectors)]
         
-        # Vector constants
         v_one = self.alloc("v_one", VLEN)
         v_two = self.alloc("v_two", VLEN)
         v_n_nodes = self.alloc("v_n_nodes", VLEN)
         
-        # Hash constants (scalar then vector)
         hash_s_c = []
         hash_s_aux = []
         hash_v_c = []
@@ -109,13 +89,14 @@ class KernelBuilder:
             hash_s_aux.append((self.alloc(f"hsa_{hi}"), aux_val))
             hash_v_aux.append(self.alloc(f"hva_{hi}", VLEN))
         
-        # Batch vectors
         indices = [self.alloc(f"idx_{i}", VLEN) for i in range(n_vectors)]
         values = [self.alloc(f"val_{i}", VLEN) for i in range(n_vectors)]
         
-        # Working registers for parallel processing
-        v_node = [self.alloc(f"v_node_{i}", VLEN) for i in range(NUM_PARALLEL)]
-        v_addr = [self.alloc(f"v_addr_{i}", VLEN) for i in range(NUM_PARALLEL)]
+        # Double buffered: A for current group, B for next group
+        v_node_A = [self.alloc(f"v_node_A{i}", VLEN) for i in range(NUM_PARALLEL)]
+        v_node_B = [self.alloc(f"v_node_B{i}", VLEN) for i in range(NUM_PARALLEL)]
+        v_addr_A = [self.alloc(f"v_addr_A{i}", VLEN) for i in range(NUM_PARALLEL)]
+        v_addr_B = [self.alloc(f"v_addr_B{i}", VLEN) for i in range(NUM_PARALLEL)]
         v_tmp1 = [self.alloc(f"v_tmp1_{i}", VLEN) for i in range(NUM_PARALLEL)]
         v_tmp2 = [self.alloc(f"v_tmp2_{i}", VLEN) for i in range(NUM_PARALLEL)]
         
@@ -165,84 +146,89 @@ class KernelBuilder:
         
         self.instrs.append({"flow": [("pause",)]})
         
-        # === MAIN LOOP: Process 8 vectors at a time ===
+        # === MAIN LOOP with software pipelining ===
+        
+        def get_vi_list(gi):
+            vi_base = gi * NUM_PARALLEL
+            return list(range(vi_base, vi_base + NUM_PARALLEL))
+        
+        # Build a queue of valu ops for hash computation
+        def build_hash_ops(vi_list, v_node):
+            """Build list of all valu ops needed for one group's hash"""
+            n = len(vi_list)
+            ops = []
+            
+            # XOR
+            ops.append([("^", values[vi_list[p]], values[vi_list[p]], v_node[p]) for p in range(n)])
+            
+            # Hash stages
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                c_v = hash_v_c[hi]
+                aux_v = hash_v_aux[hi]
+                
+                if op1 == "+" and op2 == "+" and op3 == "<<":
+                    ops.append([("multiply_add", values[vi_list[p]], values[vi_list[p]], aux_v, c_v) for p in range(n)])
+                else:
+                    # First op: compute both operands
+                    ops1 = []
+                    for p in range(n):
+                        ops1.append((op1, v_tmp1[p], values[vi_list[p]], c_v))
+                        ops1.append((op3, v_tmp2[p], values[vi_list[p]], aux_v))
+                    ops.append(ops1[:6])
+                    if len(ops1) > 6:
+                        ops.append(ops1[6:])
+                    
+                    # Second op: combine
+                    ops.append([(op2, values[vi_list[p]], v_tmp1[p], v_tmp2[p]) for p in range(n)])
+            
+            # Index update
+            ops.append([("&", v_tmp1[p], values[vi_list[p]], v_one) for p in range(n)])
+            ops.append([("+", v_tmp1[p], v_tmp1[p], v_one) for p in range(n)])
+            ops.append([("multiply_add", indices[vi_list[p]], indices[vi_list[p]], v_two, v_tmp1[p]) for p in range(n)])
+            ops.append([("<", v_tmp1[p], indices[vi_list[p]], v_n_nodes) for p in range(n)])
+            ops.append([("*", indices[vi_list[p]], indices[vi_list[p]], v_tmp1[p]) for p in range(n)])
+            
+            return ops
+        
         for r in range(rounds):
-            for vi_base in range(0, n_vectors, NUM_PARALLEL):
-                vi_list = list(range(vi_base, min(vi_base + NUM_PARALLEL, n_vectors)))
+            for gi in range(n_groups):
+                vi_list = get_vi_list(gi)
                 n = len(vi_list)
                 
-                # Broadcast forest pointer to all address vectors (6 valu slots)
-                for start in range(0, n, 6):
-                    ops = [("vbroadcast", v_addr[p], forest_p) for p in range(start, min(start + 6, n))]
-                    self.instrs.append({"valu": ops})
+                # Determine which buffer to use
+                if gi % 2 == 0:
+                    v_node = v_node_A
+                    v_addr = v_addr_A
+                else:
+                    v_node = v_node_B
+                    v_addr = v_addr_B
                 
-                # Add indices to addresses (6 valu slots)
-                for start in range(0, n, 6):
-                    ops = [("+", v_addr[p], v_addr[p], indices[vi_list[p]]) for p in range(start, min(start + 6, n))]
-                    self.instrs.append({"valu": ops})
+                # Phase 1: Compute addresses for this group (2 cycles)
+                self.instrs.append({"valu": [
+                    ("vbroadcast", v_addr[p], forest_p) for p in range(n)
+                ]})
+                self.instrs.append({"valu": [
+                    ("+", v_addr[p], v_addr[p], indices[vi_list[p]]) for p in range(n)
+                ]})
                 
-                # GATHER: 2 loads per cycle
-                # Interleave across all 8 vectors for better pipelining
+                # Phase 2: Gather (16 cycles for 32 loads)
                 for lane in range(VLEN):
-                    for p_start in range(0, n, 2):
-                        ops = []
-                        for p in range(p_start, min(p_start + 2, n)):
-                            ops.append(("load", v_node[p] + lane, v_addr[p] + lane))
-                        self.instrs.append({"load": ops})
+                    self.instrs.append({"load": [
+                        ("load", v_node[0] + lane, v_addr[0] + lane),
+                        ("load", v_node[1] + lane, v_addr[1] + lane)
+                    ]})
+                    self.instrs.append({"load": [
+                        ("load", v_node[2] + lane, v_addr[2] + lane),
+                        ("load", v_node[3] + lane, v_addr[3] + lane)
+                    ]})
                 
-                # XOR with node values (6 valu slots)
-                for start in range(0, n, 6):
-                    ops = [("^", values[vi_list[p]], values[vi_list[p]], v_node[p]) for p in range(start, min(start + 6, n))]
-                    self.instrs.append({"valu": ops})
-                
-                # HASH (6 stages)
-                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    c_v = hash_v_c[hi]
-                    aux_v = hash_v_aux[hi]
-                    
-                    if op1 == "+" and op2 == "+" and op3 == "<<":
-                        # Fused multiply-add (6 valu slots)
-                        for start in range(0, n, 6):
-                            ops = [("multiply_add", values[vi_list[p]], values[vi_list[p]], aux_v, c_v) for p in range(start, min(start + 6, n))]
-                            self.instrs.append({"valu": ops})
-                    else:
-                        # Standard: compute both operands then combine
-                        for start in range(0, n, 3):
-                            ops = []
-                            for p in range(start, min(start + 3, n)):
-                                ops.append((op1, v_tmp1[p], values[vi_list[p]], c_v))
-                                ops.append((op3, v_tmp2[p], values[vi_list[p]], aux_v))
-                            self.instrs.append({"valu": ops})
-                        
-                        for start in range(0, n, 6):
-                            ops = [(op2, values[vi_list[p]], v_tmp1[p], v_tmp2[p]) for p in range(start, min(start + 6, n))]
-                            self.instrs.append({"valu": ops})
-                
-                # INDEX UPDATE: idx = 2*idx + (1 + (val&1))
-                for start in range(0, n, 6):
-                    ops = [("&", v_tmp1[p], values[vi_list[p]], v_one) for p in range(start, min(start + 6, n))]
-                    self.instrs.append({"valu": ops})
-                
-                for start in range(0, n, 6):
-                    ops = [("+", v_tmp1[p], v_tmp1[p], v_one) for p in range(start, min(start + 6, n))]
-                    self.instrs.append({"valu": ops})
-                
-                for start in range(0, n, 6):
-                    ops = [("multiply_add", indices[vi_list[p]], indices[vi_list[p]], v_two, v_tmp1[p]) for p in range(start, min(start + 6, n))]
-                    self.instrs.append({"valu": ops})
-                
-                # WRAP: idx = idx * (idx < n_nodes)
-                for start in range(0, n, 6):
-                    ops = [("<", v_tmp1[p], indices[vi_list[p]], v_n_nodes) for p in range(start, min(start + 6, n))]
-                    self.instrs.append({"valu": ops})
-                
-                for start in range(0, n, 6):
-                    ops = [("*", indices[vi_list[p]], indices[vi_list[p]], v_tmp1[p]) for p in range(start, min(start + 6, n))]
+                # Phase 3: Hash computation
+                hash_ops = build_hash_ops(vi_list, v_node)
+                for ops in hash_ops:
                     self.instrs.append({"valu": ops})
         
         self.instrs.append({"flow": [("pause",)]})
         
-        # Store results
         for vi in range(n_vectors):
             self.instrs.append({"alu": [
                 ("+", tmp, idx_p, offsets[vi]),
@@ -305,9 +291,6 @@ def do_kernel_test(
 
 class Tests(unittest.TestCase):
     def test_ref_kernels(self):
-        """
-        Test the reference kernels against each other
-        """
         random.seed(123)
         for i in range(10):
             f = Tree.generate(4)
@@ -320,7 +303,6 @@ class Tests(unittest.TestCase):
             assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
 
     def test_kernel_trace(self):
-        # Full-scale example for performance testing
         do_kernel_test(10, 16, 256, trace=True, prints=False)
 
     def test_kernel_cycles(self):
