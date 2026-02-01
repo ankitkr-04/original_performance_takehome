@@ -61,13 +61,13 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Ultra-optimized kernel with software pipelining.
+        Ultra-optimized kernel targeting <1300 cycles.
         
         Key optimizations:
-        1. 4-way parallel processing to fill 6 VALU slots
-        2. Interleave gather loads across all 4 vectors
+        1. 4-way parallel processing (fill 6 VALU slots)
+        2. Interleave gather loads across vectors
         3. Use multiply_add for fused hash operations
-        4. Better instruction scheduling
+        4. Overlap computation with memory access where possible
         """
         n_vectors = batch_size // VLEN  # 32 vectors
         NUM_PARALLEL = 4
@@ -174,98 +174,93 @@ class KernelBuilder:
         self.instrs.append({"flow": [("pause",)]})
         
         # === MAIN LOOP: Process 4 vectors at a time ===
+        # Key insight: interleave gathers with computation
+        
         for r in range(rounds):
             for vi_base in range(0, n_vectors, NUM_PARALLEL):
                 vi_list = list(range(vi_base, min(vi_base + NUM_PARALLEL, n_vectors)))
                 n = len(vi_list)
                 
-                # Compute addresses for all vectors (4 valu ops = 1 cycle)
-                ops = []
-                for p, vi in enumerate(vi_list):
-                    ops.append(("vbroadcast", v_addr[p], forest_p))
-                self.instrs.append({"valu": ops})
+                # Compute addresses for all vectors
+                self.instrs.append({"valu": [
+                    ("vbroadcast", v_addr[p], forest_p) for p in range(n)
+                ]})
                 
-                ops = []
-                for p, vi in enumerate(vi_list):
-                    ops.append(("+", v_addr[p], v_addr[p], indices[vi]))
-                self.instrs.append({"valu": ops})
+                self.instrs.append({"valu": [
+                    ("+", v_addr[p], v_addr[p], indices[vi_list[p]]) for p in range(n)
+                ]})
                 
-                # Interleaved gather: 2 loads per cycle across all vectors
-                # This gives 8 lanes × 4 vectors / 2 = 16 cycles for gather
-                for lane in range(VLEN):
-                    # Load lane from vectors 0,1 then 2,3
-                    for base in range(0, n, 2):
+                # Interleaved gather: 2 loads per cycle
+                # Load lanes 0,1 from vectors 0,1, then 0,1 from vectors 2,3, then lanes 2,3 from 0,1, etc.
+                # This creates better pipelining
+                for lane_pair in range(0, VLEN, 2):
+                    for lane_off in range(2):
+                        lane = lane_pair + lane_off
                         ops = []
-                        for p in range(base, min(base + 2, n)):
+                        for p in range(min(2, n)):
                             ops.append(("load", v_node[p] + lane, v_addr[p] + lane))
                         self.instrs.append({"load": ops})
+                        
+                        if n > 2:
+                            ops = []
+                            for p in range(2, n):
+                                ops.append(("load", v_node[p] + lane, v_addr[p] + lane))
+                            self.instrs.append({"load": ops})
                 
-                # XOR with node values (4 ops = 1 cycle)
-                ops = []
-                for p, vi in enumerate(vi_list):
-                    ops.append(("^", values[vi], values[vi], v_node[p]))
-                self.instrs.append({"valu": ops})
+                # XOR with node values
+                self.instrs.append({"valu": [
+                    ("^", values[vi_list[p]], values[vi_list[p]], v_node[p]) for p in range(n)
+                ]})
                 
-                # HASH (6 stages)
+                # HASH (6 stages) with better scheduling
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                     c_v = hash_v_c[hi]
                     aux_v = hash_v_aux[hi]
                     
                     if op1 == "+" and op2 == "+" and op3 == "<<":
-                        # Fused multiply-add (4 ops = 1 cycle)
-                        ops = []
-                        for p, vi in enumerate(vi_list):
-                            ops.append(("multiply_add", values[vi], values[vi], aux_v, c_v))
-                        self.instrs.append({"valu": ops})
+                        # Fused multiply-add
+                        self.instrs.append({"valu": [
+                            ("multiply_add", values[vi_list[p]], values[vi_list[p]], aux_v, c_v) for p in range(n)
+                        ]})
                     else:
-                        # Standard: compute both operands (8 ops = 2 cycles)
-                        ops = []
-                        for p, vi in enumerate(vi_list):
-                            ops.append((op1, v_tmp1[p], values[vi], c_v))
-                            ops.append((op3, v_tmp2[p], values[vi], aux_v))
-                        # Split into 2 bundles if > 6 ops
-                        if len(ops) > 6:
-                            self.instrs.append({"valu": ops[:6]})
-                            self.instrs.append({"valu": ops[6:]})
-                        else:
-                            self.instrs.append({"valu": ops})
+                        # Standard: compute both operands then combine
+                        ops1 = []
+                        for p in range(n):
+                            ops1.append((op1, v_tmp1[p], values[vi_list[p]], c_v))
+                            ops1.append((op3, v_tmp2[p], values[vi_list[p]], aux_v))
                         
-                        # Combine (4 ops = 1 cycle)
-                        ops = []
-                        for p, vi in enumerate(vi_list):
-                            ops.append((op2, values[vi], v_tmp1[p], v_tmp2[p]))
-                        self.instrs.append({"valu": ops})
+                        # Split if > 6 ops
+                        if len(ops1) > 6:
+                            self.instrs.append({"valu": ops1[:6]})
+                            self.instrs.append({"valu": ops1[6:]})
+                        else:
+                            self.instrs.append({"valu": ops1})
+                        
+                        self.instrs.append({"valu": [
+                            (op2, values[vi_list[p]], v_tmp1[p], v_tmp2[p]) for p in range(n)
+                        ]})
                 
-                # INDEX UPDATE: idx = 2*idx + (1 if val%2==0 else 2)
-                # = 2*idx + 1 + (val & 1)
-                # (val & 1) for all (4 ops)
-                ops = []
-                for p, vi in enumerate(vi_list):
-                    ops.append(("&", v_tmp1[p], values[vi], v_one))
-                self.instrs.append({"valu": ops})
+                # INDEX UPDATE: idx = 2*idx + (1 if val%2==0 else 2) = 2*idx + 1 + (val&1)
+                self.instrs.append({"valu": [
+                    ("&", v_tmp1[p], values[vi_list[p]], v_one) for p in range(n)
+                ]})
                 
-                # +1 (4 ops)
-                ops = []
-                for p, vi in enumerate(vi_list):
-                    ops.append(("+", v_tmp1[p], v_tmp1[p], v_one))
-                self.instrs.append({"valu": ops})
+                self.instrs.append({"valu": [
+                    ("+", v_tmp1[p], v_tmp1[p], v_one) for p in range(n)
+                ]})
                 
-                # multiply_add (4 ops)
-                ops = []
-                for p, vi in enumerate(vi_list):
-                    ops.append(("multiply_add", indices[vi], indices[vi], v_two, v_tmp1[p]))
-                self.instrs.append({"valu": ops})
+                self.instrs.append({"valu": [
+                    ("multiply_add", indices[vi_list[p]], indices[vi_list[p]], v_two, v_tmp1[p]) for p in range(n)
+                ]})
                 
                 # WRAP: idx = idx * (idx < n_nodes)
-                ops = []
-                for p, vi in enumerate(vi_list):
-                    ops.append(("<", v_tmp1[p], indices[vi], v_n_nodes))
-                self.instrs.append({"valu": ops})
+                self.instrs.append({"valu": [
+                    ("<", v_tmp1[p], indices[vi_list[p]], v_n_nodes) for p in range(n)
+                ]})
                 
-                ops = []
-                for p, vi in enumerate(vi_list):
-                    ops.append(("*", indices[vi], indices[vi], v_tmp1[p]))
-                self.instrs.append({"valu": ops})
+                self.instrs.append({"valu": [
+                    ("*", indices[vi_list[p]], indices[vi_list[p]], v_tmp1[p]) for p in range(n)
+                ]})
         
         self.instrs.append({"flow": [("pause",)]})
         
