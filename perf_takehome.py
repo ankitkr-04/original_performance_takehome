@@ -257,53 +257,51 @@ class KernelBuilder:
                 
                 self.instrs.append(instr)
         
+        total_groups = n_groups + (1 if leftover > 0 else 0)
+        
+        # Track pending hash from previous gather
+        pending_hash_vi_list = None
+        pending_hash_v_node = None
+        
         for r in range(rounds):
-            # Process full groups with pipelining
-            for gi in range(n_groups + (1 if leftover > 0 else 0)):
+            # Process all groups with pipelining
+            for gi in range(total_groups):
                 vi_list = get_vi_list(gi)
-                n = len(vi_list)
                 
                 # Use alternating buffers
                 if gi % 2 == 0:
                     v_node = v_node_A
                     v_addr = v_addr_A
-                    v_node_prev = v_node_B
                 else:
                     v_node = v_node_B
                     v_addr = v_addr_B
-                    v_node_prev = v_node_A
                 
                 # Compute addresses for current group
                 emit_addr_calc(vi_list, v_addr)
                 
-                if gi == 0:
-                    # First group: just gather, no hash to overlap
-                    emit_gather_with_hash(vi_list, v_node, v_addr, [], None)
-                else:
-                    # Overlap: gather current group while hashing previous group
-                    prev_vi_list = get_vi_list(gi - 1)
-                    emit_gather_with_hash(vi_list, v_node, v_addr, prev_vi_list, v_node_prev)
-            
-            # Hash the last group (no more gathers to overlap)
-            last_gi = n_groups - 1 + (1 if leftover > 0 else 0)
-            last_vi_list = get_vi_list(last_gi)
-            if last_gi % 2 == 0:
-                v_node_last = v_node_A
-            else:
-                v_node_last = v_node_B
-            
-            hash_ops = build_hash_valu_ops(last_vi_list, v_node_last)
+                # Gather current group, overlap with pending hash (if any)
+                emit_gather_with_hash(vi_list, v_node, v_addr, 
+                                      pending_hash_vi_list if pending_hash_vi_list else [], 
+                                      pending_hash_v_node)
+                
+                # Current group becomes pending for next iteration
+                pending_hash_vi_list = vi_list
+                pending_hash_v_node = v_node
+        
+        # Hash the final pending group (no more gathers to overlap)
+        if pending_hash_vi_list:
+            hash_ops = build_hash_valu_ops(pending_hash_vi_list, pending_hash_v_node)
             for ops in hash_ops:
                 self.instrs.append({"valu": ops})
         
-        self.instrs.append({"flow": [("pause",)]})
-        
-        # Store results
+        # Store results BEFORE pause
         for vi in range(n_vectors):
             self.instrs.append({"store": [
                 ("vstore", v_idx_base[vi], indices[vi]),
                 ("vstore", v_val_base[vi], values[vi])
             ]})
+        
+        self.instrs.append({"flow": [("pause",)]})
 
 
 BASELINE = 147734
