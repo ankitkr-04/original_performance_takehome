@@ -47,196 +47,262 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        TRUE software-pipelined kernel.
+        TRUE software-pipelined kernel with OVERLAPPED load and compute.
         
-        Key insight: Overlap gather for group G+1 with hash computation for group G.
-        In each cycle, execute BOTH 2 loads (for next group gather) AND 6 valu ops (for current group hash).
+        Key insight: In steady state, each cycle does BOTH:
+        - 2 scalar loads (gathering node values for group G+1)
+        - Up to 6 valu ops (hashing group G)
+        
+        We process 6 vectors at a time (to use all 6 valu slots).
+        Each vector has 8 lanes = 8 loads needed.
+        With 2 loads/cycle, 6 vectors need 6*8/2 = 24 cycles to gather.
+        Hash computation per 6 vectors = ~18 valu cycles.
+        So gathering dominates - we fill valu gaps with hash ops.
         """
         n_vectors = batch_size // VLEN  # 32 vectors
-        NUM_PARALLEL = 4  # 4 vectors processed together
-        n_groups = n_vectors // NUM_PARALLEL
+        NUM_PARALLEL = 6  # 6 vectors to use all 6 valu slots
+        n_groups = n_vectors // NUM_PARALLEL  # 5 groups (with 2 leftover vectors)
+        leftover = n_vectors % NUM_PARALLEL  # 2 leftover vectors
         
         # === SCRATCH ALLOCATION ===
-        tmp = self.alloc("tmp")
-        tmp2 = self.alloc("tmp2")
+        tmp = [self.alloc(f"tmp{i}") for i in range(12)]  # temp scalars
         
         forest_p = self.alloc("forest_p")
         idx_p = self.alloc("idx_p")
         val_p = self.alloc("val_p")
         n_nodes_s = self.alloc("n_nodes_s")
         
-        zero_s = self.alloc("zero_s")
         one_s = self.alloc("one_s")
         two_s = self.alloc("two_s")
         
-        offsets = [self.alloc(f"off_{vi}") for vi in range(n_vectors)]
+        # Precomputed vector base addresses for each vector
+        v_idx_base = [self.alloc(f"vidx_base_{vi}") for vi in range(n_vectors)]
+        v_val_base = [self.alloc(f"vval_base_{vi}") for vi in range(n_vectors)]
         
         v_one = self.alloc("v_one", VLEN)
         v_two = self.alloc("v_two", VLEN)
         v_n_nodes = self.alloc("v_n_nodes", VLEN)
         
-        hash_s_c = []
-        hash_s_aux = []
+        # Hash constants - pre-broadcast to vectors
         hash_v_c = []
         hash_v_aux = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            hash_s_c.append(self.alloc(f"hsc_{hi}"))
             hash_v_c.append(self.alloc(f"hvc_{hi}", VLEN))
             if op1 == "+" and op2 == "+" and op3 == "<<":
                 aux_val = 1 + (1 << val3)
             else:
                 aux_val = val3
-            hash_s_aux.append((self.alloc(f"hsa_{hi}"), aux_val))
-            hash_v_aux.append(self.alloc(f"hva_{hi}", VLEN))
+            hash_v_aux.append((self.alloc(f"hva_{hi}", VLEN), aux_val))
         
         indices = [self.alloc(f"idx_{i}", VLEN) for i in range(n_vectors)]
         values = [self.alloc(f"val_{i}", VLEN) for i in range(n_vectors)]
         
-        # Double buffered: A for current group, B for next group
+        # Triple buffer for pipelining: A, B, C
         v_node_A = [self.alloc(f"v_node_A{i}", VLEN) for i in range(NUM_PARALLEL)]
         v_node_B = [self.alloc(f"v_node_B{i}", VLEN) for i in range(NUM_PARALLEL)]
         v_addr_A = [self.alloc(f"v_addr_A{i}", VLEN) for i in range(NUM_PARALLEL)]
         v_addr_B = [self.alloc(f"v_addr_B{i}", VLEN) for i in range(NUM_PARALLEL)]
+        
+        # Temp vectors for hash computation
         v_tmp1 = [self.alloc(f"v_tmp1_{i}", VLEN) for i in range(NUM_PARALLEL)]
         v_tmp2 = [self.alloc(f"v_tmp2_{i}", VLEN) for i in range(NUM_PARALLEL)]
         
         # === INITIALIZATION ===
-        self.instrs.append({"load": [("const", tmp, 1), ("const", tmp2, 4)]})
-        self.instrs.append({"load": [("load", n_nodes_s, tmp), ("load", forest_p, tmp2)]})
-        self.instrs.append({"load": [("const", tmp, 5), ("const", tmp2, 6)]})
-        self.instrs.append({"load": [("load", idx_p, tmp), ("load", val_p, tmp2)]})
+        # Load header values
+        self.instrs.append({"load": [("const", tmp[0], 1), ("const", tmp[1], 4)]})
+        self.instrs.append({"load": [("load", n_nodes_s, tmp[0]), ("load", forest_p, tmp[1])]})
+        self.instrs.append({"load": [("const", tmp[0], 5), ("const", tmp[1], 6)]})
+        self.instrs.append({"load": [("load", idx_p, tmp[0]), ("load", val_p, tmp[1])]})
         
-        self.instrs.append({"load": [("const", zero_s, 0), ("const", one_s, 1)]})
-        self.instrs.append({"load": [("const", two_s, 2)]})
+        self.instrs.append({"load": [("const", one_s, 1), ("const", two_s, 2)]})
         
-        for vi in range(0, n_vectors, 2):
-            ops = [("const", offsets[vi], vi * VLEN)]
-            if vi + 1 < n_vectors:
-                ops.append(("const", offsets[vi + 1], (vi + 1) * VLEN))
-            self.instrs.append({"load": ops})
-        
+        # Load hash constants using scalar temps then broadcast
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            s_aux, aux_val = hash_s_aux[hi]
-            self.instrs.append({"load": [("const", hash_s_c[hi], val1), ("const", s_aux, aux_val)]})
+            aux_addr, aux_val = hash_v_aux[hi]
+            self.instrs.append({"load": [("const", tmp[0], val1), ("const", tmp[1], aux_val)]})
+            self.instrs.append({"valu": [
+                ("vbroadcast", hash_v_c[hi], tmp[0]),
+                ("vbroadcast", aux_addr, tmp[1])
+            ]})
         
+        # Broadcast scalar constants to vectors
         self.instrs.append({"valu": [
             ("vbroadcast", v_one, one_s),
             ("vbroadcast", v_two, two_s),
             ("vbroadcast", v_n_nodes, n_nodes_s)
         ]})
         
-        for hi in range(0, len(HASH_STAGES), 3):
-            ops = []
-            for hj in range(3):
-                if hi + hj < len(HASH_STAGES):
-                    s_aux, _ = hash_s_aux[hi + hj]
-                    ops.append(("vbroadcast", hash_v_c[hi + hj], hash_s_c[hi + hj]))
-                    ops.append(("vbroadcast", hash_v_aux[hi + hj], s_aux))
-            self.instrs.append({"valu": ops})
-        
+        # Compute base addresses for each vector's idx and val arrays
         for vi in range(n_vectors):
+            self.instrs.append({"load": [("const", tmp[0], vi * VLEN)]})
             self.instrs.append({"alu": [
-                ("+", tmp, idx_p, offsets[vi]),
-                ("+", tmp2, val_p, offsets[vi])
+                ("+", v_idx_base[vi], idx_p, tmp[0]),
+                ("+", v_val_base[vi], val_p, tmp[0])
             ]})
+        
+        # Load initial indices and values
+        for vi in range(n_vectors):
             self.instrs.append({"load": [
-                ("vload", indices[vi], tmp),
-                ("vload", values[vi], tmp2)
+                ("vload", indices[vi], v_idx_base[vi]),
+                ("vload", values[vi], v_val_base[vi])
             ]})
         
         self.instrs.append({"flow": [("pause",)]})
         
-        # === MAIN LOOP with software pipelining ===
+        # === MAIN LOOP with TRUE software pipelining ===
         
         def get_vi_list(gi):
+            """Get vector indices for group gi"""
             vi_base = gi * NUM_PARALLEL
-            return list(range(vi_base, vi_base + NUM_PARALLEL))
+            return list(range(vi_base, min(vi_base + NUM_PARALLEL, n_vectors)))
         
-        # Build a queue of valu ops for hash computation
-        def build_hash_ops(vi_list, v_node):
-            """Build list of all valu ops needed for one group's hash"""
+        def emit_addr_calc(vi_list, v_addr):
+            """Emit address calculation: v_addr[p] = forest_p + indices[vi_list[p]]"""
+            n = len(vi_list)
+            # Broadcast forest_p and add indices
+            self.instrs.append({"valu": [
+                ("vbroadcast", v_addr[p], forest_p) for p in range(min(n, 6))
+            ]})
+            self.instrs.append({"valu": [
+                ("+", v_addr[p], v_addr[p], indices[vi_list[p]]) for p in range(min(n, 6))
+            ]})
+        
+        def build_hash_valu_ops(vi_list, v_node):
+            """Build list of all valu ops needed for one group's hash.
+            Returns list of (list of valu ops) - each inner list ≤ 6 ops."""
             n = len(vi_list)
             ops = []
             
-            # XOR
+            # XOR: value ^= node_val
             ops.append([("^", values[vi_list[p]], values[vi_list[p]], v_node[p]) for p in range(n)])
             
             # Hash stages
             for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                 c_v = hash_v_c[hi]
-                aux_v = hash_v_aux[hi]
+                aux_v = hash_v_aux[hi][0]
                 
                 if op1 == "+" and op2 == "+" and op3 == "<<":
+                    # Optimized: value = value * (1 + (1 << val3)) + c
                     ops.append([("multiply_add", values[vi_list[p]], values[vi_list[p]], aux_v, c_v) for p in range(n)])
                 else:
-                    # First op: compute both operands
+                    # General: tmp1 = op1(value, c), tmp2 = op3(value, aux), value = op2(tmp1, tmp2)
+                    # Split into ≤6 ops per cycle
                     ops1 = []
                     for p in range(n):
                         ops1.append((op1, v_tmp1[p], values[vi_list[p]], c_v))
                         ops1.append((op3, v_tmp2[p], values[vi_list[p]], aux_v))
-                    ops.append(ops1[:6])
-                    if len(ops1) > 6:
-                        ops.append(ops1[6:])
+                    # Emit in chunks of 6
+                    for i in range(0, len(ops1), 6):
+                        ops.append(ops1[i:i+6])
                     
-                    # Second op: combine
+                    # Combine
                     ops.append([(op2, values[vi_list[p]], v_tmp1[p], v_tmp2[p]) for p in range(n)])
             
-            # Index update
+            # Index update: idx = 2*idx + (1 if (val&1)==0 else 2) = 2*idx + 1 + (val&1)
+            # But actually: branch = (val&1)+1, idx = idx*2 + branch
             ops.append([("&", v_tmp1[p], values[vi_list[p]], v_one) for p in range(n)])
             ops.append([("+", v_tmp1[p], v_tmp1[p], v_one) for p in range(n)])
             ops.append([("multiply_add", indices[vi_list[p]], indices[vi_list[p]], v_two, v_tmp1[p]) for p in range(n)])
+            
+            # Wrap check: if idx >= n_nodes, idx = 0
             ops.append([("<", v_tmp1[p], indices[vi_list[p]], v_n_nodes) for p in range(n)])
             ops.append([("*", indices[vi_list[p]], indices[vi_list[p]], v_tmp1[p]) for p in range(n)])
             
             return ops
         
+        def emit_gather_with_hash(gather_vi_list, v_node_gather, v_addr_gather, hash_vi_list, v_node_hash):
+            """
+            Emit interleaved gather and hash operations.
+            Gather: Load node values for gather_vi_list using v_addr_gather into v_node_gather
+            Hash: Compute hash for hash_vi_list using v_node_hash
+            
+            We have 2 load slots and 6 valu slots per cycle.
+            Gather needs 8 loads per vector * n_vectors / 2 = cycles
+            Hash needs ~18 valu cycles for 6 vectors.
+            """
+            n_gather = len(gather_vi_list)
+            
+            # Build load sequence: for each vector, load all 8 lanes
+            load_ops = []
+            for p in range(n_gather):
+                for lane in range(VLEN):
+                    load_ops.append(("load", v_node_gather[p] + lane, v_addr_gather[p] + lane))
+            
+            # Build hash valu ops
+            if hash_vi_list:
+                hash_ops = build_hash_valu_ops(hash_vi_list, v_node_hash)
+            else:
+                hash_ops = []
+            
+            # Interleave: 2 loads per cycle, up to 6 valus per cycle
+            load_idx = 0
+            hash_idx = 0
+            
+            while load_idx < len(load_ops) or hash_idx < len(hash_ops):
+                instr = {}
+                
+                # Add up to 2 loads
+                if load_idx < len(load_ops):
+                    loads = []
+                    for _ in range(2):
+                        if load_idx < len(load_ops):
+                            loads.append(load_ops[load_idx])
+                            load_idx += 1
+                    instr["load"] = loads
+                
+                # Add up to 6 valus (one hash step)
+                if hash_idx < len(hash_ops):
+                    instr["valu"] = hash_ops[hash_idx]
+                    hash_idx += 1
+                
+                self.instrs.append(instr)
+        
         for r in range(rounds):
-            for gi in range(n_groups):
+            # Process full groups with pipelining
+            for gi in range(n_groups + (1 if leftover > 0 else 0)):
                 vi_list = get_vi_list(gi)
                 n = len(vi_list)
                 
-                # Determine which buffer to use
+                # Use alternating buffers
                 if gi % 2 == 0:
                     v_node = v_node_A
                     v_addr = v_addr_A
+                    v_node_prev = v_node_B
                 else:
                     v_node = v_node_B
                     v_addr = v_addr_B
+                    v_node_prev = v_node_A
                 
-                # Phase 1: Compute addresses for this group (2 cycles)
-                self.instrs.append({"valu": [
-                    ("vbroadcast", v_addr[p], forest_p) for p in range(n)
-                ]})
-                self.instrs.append({"valu": [
-                    ("+", v_addr[p], v_addr[p], indices[vi_list[p]]) for p in range(n)
-                ]})
+                # Compute addresses for current group
+                emit_addr_calc(vi_list, v_addr)
                 
-                # Phase 2: Gather (16 cycles for 32 loads)
-                for lane in range(VLEN):
-                    self.instrs.append({"load": [
-                        ("load", v_node[0] + lane, v_addr[0] + lane),
-                        ("load", v_node[1] + lane, v_addr[1] + lane)
-                    ]})
-                    self.instrs.append({"load": [
-                        ("load", v_node[2] + lane, v_addr[2] + lane),
-                        ("load", v_node[3] + lane, v_addr[3] + lane)
-                    ]})
-                
-                # Phase 3: Hash computation
-                hash_ops = build_hash_ops(vi_list, v_node)
-                for ops in hash_ops:
-                    self.instrs.append({"valu": ops})
+                if gi == 0:
+                    # First group: just gather, no hash to overlap
+                    emit_gather_with_hash(vi_list, v_node, v_addr, [], None)
+                else:
+                    # Overlap: gather current group while hashing previous group
+                    prev_vi_list = get_vi_list(gi - 1)
+                    emit_gather_with_hash(vi_list, v_node, v_addr, prev_vi_list, v_node_prev)
+            
+            # Hash the last group (no more gathers to overlap)
+            last_gi = n_groups - 1 + (1 if leftover > 0 else 0)
+            last_vi_list = get_vi_list(last_gi)
+            if last_gi % 2 == 0:
+                v_node_last = v_node_A
+            else:
+                v_node_last = v_node_B
+            
+            hash_ops = build_hash_valu_ops(last_vi_list, v_node_last)
+            for ops in hash_ops:
+                self.instrs.append({"valu": ops})
         
         self.instrs.append({"flow": [("pause",)]})
         
+        # Store results
         for vi in range(n_vectors):
-            self.instrs.append({"alu": [
-                ("+", tmp, idx_p, offsets[vi]),
-                ("+", tmp2, val_p, offsets[vi])
-            ]})
             self.instrs.append({"store": [
-                ("vstore", tmp, indices[vi]),
-                ("vstore", tmp2, values[vi])
+                ("vstore", v_idx_base[vi], indices[vi]),
+                ("vstore", v_val_base[vi], values[vi])
             ]})
 
 
