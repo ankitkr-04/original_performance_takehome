@@ -48,6 +48,8 @@ class TraceStats:
     longest_idle_streak: int
     avg_slots_per_instr: float
     tail_drain_cycles: int
+    last_gather_cycle: int
+    first_store_cycle: int
 
 
 def parse_trace_json(trace_path: str) -> List[Dict]:
@@ -233,7 +235,9 @@ def analyze_trace(trace_path: str, verbose: bool = False) -> TraceStats:
         bubble_cycles=bubble_count,
         longest_idle_streak=longest_idle_streak,
         avg_slots_per_instr=avg_slots_per_instr,
-        tail_drain_cycles=tail_drain
+        tail_drain_cycles=tail_drain,
+        last_gather_cycle=last_gather_cycle,
+        first_store_cycle=first_store_cycle
     )
 
 

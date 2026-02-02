@@ -200,12 +200,12 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             stats = analyze_trace(trace_path, verbose=verbose)
             result = {
                 "total_cycles": stats.total_cycles,
-                "load_utilization": round(stats.load_util, 2),
-                "valu_utilization": round(stats.valu_util, 2),
-                "alu_utilization": round(stats.alu_util, 2),
-                "store_utilization": round(stats.store_util, 2),
-                "bubble_cycles": stats.bubble_count,
-                "tail_drain_cycles": stats.tail_drain,
+                "load_utilization": round(stats.load_utilization, 2),
+                "valu_utilization": round(stats.valu_utilization, 2),
+                "alu_utilization": round(stats.alu_utilization, 2),
+                "store_utilization": round(stats.store_utilization, 2),
+                "bubble_cycles": stats.bubble_cycles,
+                "tail_drain_cycles": stats.tail_drain_cycles,
                 "last_gather_cycle": stats.last_gather_cycle,
                 "first_store_cycle": stats.first_store_cycle
             }
@@ -227,9 +227,9 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             if analyze:
                 stats = analyze_trace(output_path, verbose=False)
                 result.update({
-                    "load_utilization": round(stats.load_util, 2),
-                    "valu_utilization": round(stats.valu_util, 2),
-                    "tail_drain_cycles": stats.tail_drain
+                    "load_utilization": round(stats.load_utilization, 2),
+                    "valu_utilization": round(stats.valu_utilization, 2),
+                    "tail_drain_cycles": stats.tail_drain_cycles
                 })
             
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
@@ -269,8 +269,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             with redirect_stdout(f):
                 attribute_cycles_to_rounds(
                     trace_path,
-                    num_rounds=num_rounds,
-                    vectors_per_round=vectors_per_round,
+                    rounds=num_rounds,
+                    n_vectors=vectors_per_round,
                     num_parallel=num_parallel,
                     verbose=True
                 )
@@ -281,15 +281,20 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     
     elif name == "slot_packing":
         from perf_takehome import KernelBuilder
-        from problem import VLEN, HASH_STAGES
+        from problem import Tree, Input, build_mem_image
         
         rounds = arguments.get("rounds", 16)
         batch_size = arguments.get("batch_size", 256)
         tree_height = arguments.get("tree_height", 10)
         
         try:
-            kb = KernelBuilder(VLEN, HASH_STAGES)
-            kb.kernel(rounds, batch_size, tree_height)
+            import random
+            random.seed(123)
+            forest = Tree.generate(tree_height)
+            inp = Input.generate(forest, batch_size, rounds)
+            
+            kb = KernelBuilder()
+            kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
             
             import io
             from contextlib import redirect_stdout
@@ -304,15 +309,20 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     
     elif name == "gather_pressure":
         from perf_takehome import KernelBuilder
-        from problem import VLEN, HASH_STAGES
+        from problem import Tree, Input, build_mem_image
         
         rounds = arguments.get("rounds", 16)
         batch_size = arguments.get("batch_size", 256)
         tree_height = arguments.get("tree_height", 10)
         
         try:
-            kb = KernelBuilder(VLEN, HASH_STAGES)
-            kb.kernel(rounds, batch_size, tree_height)
+            import random
+            random.seed(123)
+            forest = Tree.generate(tree_height)
+            inp = Input.generate(forest, batch_size, rounds)
+            
+            kb = KernelBuilder()
+            kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
             
             import io
             from contextlib import redirect_stdout
@@ -342,15 +352,20 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     
     elif name == "hash_stages":
         from perf_takehome import KernelBuilder
-        from problem import VLEN, HASH_STAGES
+        from problem import Tree, Input, build_mem_image
         
         rounds = arguments.get("rounds", 16)
         batch_size = arguments.get("batch_size", 256)
         tree_height = arguments.get("tree_height", 10)
         
         try:
-            kb = KernelBuilder(VLEN, HASH_STAGES)
-            kb.kernel(rounds, batch_size, tree_height)
+            import random
+            random.seed(123)
+            forest = Tree.generate(tree_height)
+            inp = Input.generate(forest, batch_size, rounds)
+            
+            kb = KernelBuilder()
+            kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
             
             import io
             from contextlib import redirect_stdout
@@ -365,15 +380,20 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     
     elif name == "address_lifetimes":
         from perf_takehome import KernelBuilder
-        from problem import VLEN, HASH_STAGES
+        from problem import Tree, Input, build_mem_image
         
         rounds = arguments.get("rounds", 16)
         batch_size = arguments.get("batch_size", 256)
         tree_height = arguments.get("tree_height", 10)
         
         try:
-            kb = KernelBuilder(VLEN, HASH_STAGES)
-            kb.kernel(rounds, batch_size, tree_height)
+            import random
+            random.seed(123)
+            forest = Tree.generate(tree_height)
+            inp = Input.generate(forest, batch_size, rounds)
+            
+            kb = KernelBuilder()
+            kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
             
             import io
             from contextlib import redirect_stdout
