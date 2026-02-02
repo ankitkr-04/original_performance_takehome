@@ -14,7 +14,7 @@ import re
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from trace_mcp import parse_trace_json
+from perf_mcp.trace_mcp import parse_trace_json
 
 
 @dataclass
